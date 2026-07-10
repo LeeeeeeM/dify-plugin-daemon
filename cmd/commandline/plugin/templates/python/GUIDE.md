@@ -21,7 +21,8 @@ You can create:
 
 ### Requirements
 - Python 3.11+
-- Dependencies: `pip install -r requirements.txt`
+- Dependencies: `uv sync` (from `pyproject.toml`, recommended) or `pip install -r requirements.txt`
+- When adding a dependency, declare it in both `pyproject.toml` and `requirements.txt` and keep them in sync
 
 ## Development Process
 
@@ -103,7 +104,7 @@ Study these examples to understand plugin implementation:
 
 2. Run your plugin: 
    ```bash
-   python -m main
+   uv run python -m main
    ```
 
 3. Refresh your Dify instance to see the plugin (marked as "debugging")
@@ -135,3 +136,17 @@ When you create a release, the action will:
 ## Privacy Policy
 
 If publishing to the Marketplace, provide a privacy policy in [PRIVACY.md](PRIVACY.md).
+
+## Marketplace Submission Checklist
+
+Plugin PRs to [langgenius/dify-plugins](https://github.com/langgenius/dify-plugins) are reviewed against these rules — check them before submitting:
+
+- [ ] The PR contains exactly one `.difypkg` file
+- [ ] The PR title and body are written in English
+- [ ] `manifest.yaml`, `README.md`, `PRIVACY.md` and `_assets/` are all present
+- [ ] The `author` field in `manifest.yaml` does not contain `langgenius` or `dify`
+- [ ] The default template icon in `_assets/` has been replaced with your own
+- [ ] The plugin version is not already published on the Marketplace
+- [ ] `README.md` contains no Chinese characters — put translations in localized files like `README_zh_Hans.md` ([multilingual README guide](https://docs.dify.ai/en/develop-plugin/features-and-specs/plugin-types/multilingual-readme))
+- [ ] `PRIVACY.md` is filled in, not the generated placeholder
+- [ ] `pip install -r requirements.txt` succeeds, `dify_plugin` is `>= 0.9.0`, and `pyproject.toml` stays in sync with it
