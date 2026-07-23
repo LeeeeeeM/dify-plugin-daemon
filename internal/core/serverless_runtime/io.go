@@ -3,6 +3,7 @@ package serverless_runtime
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,9 +16,100 @@ import (
 	"github.com/langgenius/dify-plugin-daemon/pkg/entities/plugin_entities"
 	routinepkg "github.com/langgenius/dify-plugin-daemon/pkg/routine"
 	"github.com/langgenius/dify-plugin-daemon/pkg/utils/http_requests"
+	"github.com/langgenius/dify-plugin-daemon/pkg/utils/log"
 	"github.com/langgenius/dify-plugin-daemon/pkg/utils/parser"
 	"github.com/langgenius/dify-plugin-daemon/pkg/utils/routine"
 )
+
+const serverlessErrorResponseLimit = 4 * 1024
+
+type serverlessErrorResponse struct {
+	ErrorType    string `json:"errorType"`
+	ErrorMessage string `json:"errorMessage"`
+	RequestID    string `json:"requestId"`
+}
+
+func parseServerlessErrorResponse(data []byte) serverlessErrorResponse {
+	var errorResponse serverlessErrorResponse
+	_ = json.Unmarshal(data, &errorResponse)
+	return errorResponse
+}
+
+func readServerlessResponseBody(reader io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(reader, serverlessErrorResponseLimit))
+}
+
+func serverlessRuntimeErrorDetails(
+	response *http.Response,
+	responseBody []byte,
+) serverlessErrorResponse {
+	details := parseServerlessErrorResponse(responseBody)
+	if errorType := response.Header.Get("x-amzn-ErrorType"); errorType != "" {
+		details.ErrorType = errorType
+	}
+	if requestID := response.Header.Get("x-amzn-RequestId"); requestID != "" {
+		details.RequestID = requestID
+	}
+	return details
+}
+
+func buildServerlessRuntimeError(
+	response *http.Response,
+	responseBody []byte,
+	fallbackReason string,
+) plugin_entities.ErrorResponse {
+	details := serverlessRuntimeErrorDetails(response, responseBody)
+	if details.ErrorType == "" {
+		details.ErrorType = fallbackReason
+	}
+	if details.ErrorType == "" {
+		details.ErrorType = fmt.Sprintf("HTTP %d", response.StatusCode)
+	}
+
+	args := map[string]any{
+		"status_code": response.StatusCode,
+	}
+	if details.RequestID != "" {
+		args["request_id"] = details.RequestID
+	}
+	message := fmt.Sprintf("Plugin runtime request failed: %s", details.ErrorType)
+	if details.ErrorMessage != "" {
+		message += ": " + details.ErrorMessage
+	}
+
+	return plugin_entities.ErrorResponse{
+		ErrorType: "PluginRuntimeError",
+		Message:   message,
+		Args:      args,
+	}
+}
+
+func logServerlessResponseFailure(
+	message string,
+	sessionID string,
+	action access_types.PluginAccessAction,
+	payloadSize int,
+	response *http.Response,
+	responseBody []byte,
+	responseBodyErr error,
+) {
+	details := serverlessRuntimeErrorDetails(response, responseBody)
+	args := []any{
+		"session_id", sessionID,
+		"action", action,
+		"payload_size_bytes", payloadSize,
+		"status_code", response.StatusCode,
+		"lambda_request_id", details.RequestID,
+		"lambda_error_type", details.ErrorType,
+		"content_type", response.Header.Get("Content-Type"),
+		"content_length", response.ContentLength,
+		"response_body_size_bytes", len(responseBody),
+	}
+	if responseBodyErr != nil {
+		args = append(args, "response_body_error", responseBodyErr)
+	}
+	log.Error(message, args...)
+}
 
 func (r *ServerlessPluginRuntime) Listen(sessionId string) (
 	*entities.Broadcast[plugin_entities.SessionMessage],
@@ -79,6 +171,14 @@ func (r *ServerlessPluginRuntime) invokeServerlessWithRetry(
 		)
 
 		if err != nil {
+			log.Warn(
+				"serverless runtime HTTP request attempt failed",
+				"session_id", sessionId,
+				"attempt", attempt+1,
+				"max_attempts", maxRetries,
+				"payload_size_bytes", len(data),
+				"error", err,
+			)
 			lastErr = fmt.Errorf("attempt %d/%d failed: %w", attempt+1, maxRetries, err)
 			continue
 		}
@@ -94,6 +194,18 @@ func (r *ServerlessPluginRuntime) invokeServerlessWithRetry(
 			if response.Body != nil {
 				response.Body.Close()
 			}
+			log.Warn(
+				"serverless runtime HTTP response will be retried",
+				"session_id", sessionId,
+				"attempt", attempt+1,
+				"max_attempts", maxRetries,
+				"payload_size_bytes", len(data),
+				"status_code", response.StatusCode,
+				"lambda_request_id", response.Header.Get("x-amzn-RequestId"),
+				"lambda_error_type", response.Header.Get("x-amzn-ErrorType"),
+				"content_type", response.Header.Get("Content-Type"),
+				"content_length", response.ContentLength,
+			)
 			lastErr = fmt.Errorf("attempt %d/%d failed with status code: %d", attempt+1, maxRetries, statusCode)
 			continue
 		}
@@ -131,64 +243,137 @@ func (r *ServerlessPluginRuntime) Write(
 		routinepkg.RoutineLabelKeySessionID: sessionId,
 		routinepkg.RoutineLabelKeyLambdaURL: r.LambdaURL,
 	}, func() {
-		defer r.listeners.Delete(sessionId)
-		defer l.Close()
-		defer l.Send(plugin_entities.SessionMessage{
-			Type: plugin_entities.SESSION_MESSAGE_TYPE_END,
-			Data: []byte(""),
-		})
+		sendEnd := true
+		sendError := func(errorResponse plugin_entities.ErrorResponse) {
+			if !sendEnd {
+				return
+			}
+			sendEnd = false
+			l.Send(plugin_entities.SessionMessage{
+				Type: plugin_entities.SESSION_MESSAGE_TYPE_ERROR,
+				Data: parser.MarshalJsonBytes(errorResponse),
+			})
+		}
+		defer func() {
+			if sendEnd {
+				l.Send(plugin_entities.SessionMessage{
+					Type: plugin_entities.SESSION_MESSAGE_TYPE_END,
+					Data: []byte(""),
+				})
+			}
+			l.Close()
+			r.listeners.Delete(sessionId)
+		}()
 
 		url += "?action=" + string(action)
 		response, err := r.invokeServerlessWithRetry(url, sessionId, data)
 		if err != nil {
-			l.Send(plugin_entities.SessionMessage{
-				Type: plugin_entities.SESSION_MESSAGE_TYPE_ERROR,
-				Data: parser.MarshalJsonBytes(plugin_entities.ErrorResponse{
-					ErrorType: "PluginDaemonInnerError",
-					Message:   fmt.Sprintf("Error sending request to serverless: %v", err),
-				}),
+			log.Error(
+				"serverless runtime invocation failed before receiving a response",
+				"session_id", sessionId,
+				"action", action,
+				"payload_size_bytes", len(data),
+				"error", err,
+			)
+			sendError(plugin_entities.ErrorResponse{
+				ErrorType: "PluginDaemonInnerError",
+				Message:   fmt.Sprintf("Error sending request to serverless: %v", err),
 			})
 			return
 		}
 
-		scanner := bufio.NewScanner(response.Body)
 		defer response.Body.Close()
+		logFailure := func(message string, responseBody []byte, responseBodyErr error) {
+			logServerlessResponseFailure(
+				message,
+				sessionId,
+				action,
+				len(data),
+				response,
+				responseBody,
+				responseBodyErr,
+			)
+		}
+		sendRuntimeError := func(message string, responseBody []byte, responseBodyErr error, fallbackReason string) {
+			logFailure(message, responseBody, responseBodyErr)
+			sendError(buildServerlessRuntimeError(response, responseBody, fallbackReason))
+		}
+
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			responseBody, responseBodyErr := readServerlessResponseBody(response.Body)
+			sendRuntimeError(
+				"serverless runtime returned non-success HTTP response",
+				responseBody,
+				responseBodyErr,
+				response.Status,
+			)
+			return
+		}
+
+		if response.Header.Get("x-amzn-ErrorType") != "" {
+			responseBody, responseBodyErr := readServerlessResponseBody(response.Body)
+			sendRuntimeError(
+				"serverless runtime returned Lambda error headers with successful HTTP status",
+				responseBody,
+				responseBodyErr,
+				"Lambda runtime error",
+			)
+			return
+		}
+
+		scanner := bufio.NewScanner(response.Body)
 
 		scanner.Buffer(make([]byte, r.RuntimeBufferSize), r.RuntimeMaxBufferSize)
 
-		sessionAlive := true
-		for scanner.Scan() && sessionAlive {
-			bytes := scanner.Bytes()
+		hasSessionEvent := false
+		for sendEnd && scanner.Scan() {
+			line := scanner.Bytes()
 
-			if len(bytes) == 0 {
+			if len(line) == 0 {
 				continue
 			}
 
+			lambdaError := parseServerlessErrorResponse(line)
+			if lambdaError.ErrorType != "" {
+				sendRuntimeError(
+					"serverless runtime returned Lambda error payload with successful HTTP status",
+					line,
+					nil,
+					"Lambda runtime error",
+				)
+				break
+			}
+
 			plugin_entities.ParsePluginUniversalEvent(
-				bytes,
+				line,
 				response.Status,
-				func(session_id string, data []byte) {
-					sessionMessage, err := parser.UnmarshalJsonBytes[plugin_entities.SessionMessage](data)
+				func(session_id string, sessionData []byte) {
+					sessionMessage, err := parser.UnmarshalJsonBytes[plugin_entities.SessionMessage](sessionData)
 					if err != nil {
-						l.Send(plugin_entities.SessionMessage{
-							Type: plugin_entities.SESSION_MESSAGE_TYPE_ERROR,
-							Data: parser.MarshalJsonBytes(plugin_entities.ErrorResponse{
-								ErrorType: "PluginDaemonInnerError",
-								Message:   fmt.Sprintf("failed to parse session message %s, err: %v", bytes, err),
-							}),
+						logFailure(
+							"serverless runtime returned an invalid session message",
+							line,
+							nil,
+						)
+						sendError(plugin_entities.ErrorResponse{
+							ErrorType: "PluginDaemonInnerError",
+							Message:   fmt.Sprintf("failed to parse session message %s, err: %v", line, err),
 						})
-						sessionAlive = false
+						return
 					}
+					hasSessionEvent = true
 					l.Send(sessionMessage)
 				},
 				func() {},
 				func(err string) {
-					l.Send(plugin_entities.SessionMessage{
-						Type: plugin_entities.SESSION_MESSAGE_TYPE_ERROR,
-						Data: parser.MarshalJsonBytes(plugin_entities.ErrorResponse{
-							ErrorType: "PluginDaemonInnerError",
-							Message:   fmt.Sprintf("encountered an error: %v", err),
-						}),
+					logFailure(
+						"serverless runtime returned an invalid plugin event",
+						line,
+						nil,
+					)
+					sendError(plugin_entities.ErrorResponse{
+						ErrorType: "PluginDaemonInnerError",
+						Message:   fmt.Sprintf("encountered an error: %v", err),
 					})
 				},
 				func(plugin_entities.PluginLogEvent) {},
@@ -196,13 +381,25 @@ func (r *ServerlessPluginRuntime) Write(
 		}
 
 		if err := scanner.Err(); err != nil {
-			l.Send(plugin_entities.SessionMessage{
-				Type: plugin_entities.SESSION_MESSAGE_TYPE_ERROR,
-				Data: parser.MarshalJsonBytes(plugin_entities.ErrorResponse{
-					ErrorType: "PluginDaemonInnerError",
-					Message:   fmt.Sprintf("failed to read response body: %v", err),
-				}),
+			logFailure(
+				"serverless runtime response body could not be read",
+				nil,
+				err,
+			)
+			sendError(plugin_entities.ErrorResponse{
+				ErrorType: "PluginDaemonInnerError",
+				Message:   fmt.Sprintf("failed to read response body: %v", err),
 			})
+			return
+		}
+
+		if !hasSessionEvent && sendEnd {
+			sendRuntimeError(
+				"serverless runtime returned no valid session response",
+				nil,
+				nil,
+				"no valid session response",
+			)
 		}
 	})
 
